@@ -291,23 +291,48 @@ def optimize_schedule(data: dict) -> dict:
     solver.parameters.max_time_in_seconds = 30.0
 
     def _solve_maximize(objective_expr, label: str):
-        """Maximize objective_expr and return (status, optimum_value)."""
+        """Maximize objective_expr and return (status, optimum_value).
+
+        Returns the exact integer optimum only when the solver status is
+        cp_model.OPTIMAL — a proven global optimum.  FEASIBLE is intentionally
+        NOT treated as a proven optimum for an intermediate lexicographic
+        stage: accepting a FEASIBLE (non-proven) value and locking it in as
+        an equality constraint could make later stages infeasible if a better
+        solution actually existed.
+
+        The optimum is read via solver.Value() on the CP-SAT integer
+        expression — NOT via solver.ObjectiveValue() which returns a float
+        and can introduce rounding errors when converted to int.
+        """
         model.Maximize(objective_expr)
         status = solver.Solve(model)
-        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return status, solver.ObjectiveValue()
+        if status == cp_model.OPTIMAL:
+            # Use solver.Value() to obtain the exact proven integer optimum.
+            # solver.ObjectiveValue() returns a float and is deliberately
+            # avoided here to prevent silent rounding bugs.
+            exact_int = solver.Value(objective_expr)
+            return status, exact_int
+        # FEASIBLE or any other non-OPTIMAL status: do not lock this stage.
         return status, None
 
-    def _fix_optimum(var_list, coeff_list, optimum_value):
+    def _lock_stage(stage_expr, exact_optimum, label: str):
         """
-        Add a constraint that the weighted sum of var_list * coeff_list
-        is at least optimum_value, locking in the gain from this stage.
+        Pin a stage's objective to its proven optimum using equality (==).
+
+        Using == rather than >= is intentional:
+          * >= would allow later stages to inadvertently raise this value,
+            which can cascade and over-constrain subsequent stages.
+          * == precisely preserves the proven optimum while giving the next
+            stage full freedom within that fixed constraint.
+
+        Only called when exact_optimum is not None (i.e. status was OPTIMAL).
         """
-        if optimum_value is not None:
-            model.Add(
-                sum(int(c) * v for c, v in zip(coeff_list, var_list))
-                >= int(optimum_value)
-            )
+        model.Add(stage_expr == exact_optimum)
+
+    # Track the overall solver status. If an intermediate stage fails to prove
+    # OPTIMAL (e.g. returns FEASIBLE on a timeout), we stop optimizing lower-priority
+    # objectives to prevent them from sacrificing the unfinished higher-priority one.
+    final_status = cp_model.UNKNOWN
 
     # ── Stage 1: Maximize CRITICAL jobs scheduled ──────────────────────────
     # Safety hierarchy: CRITICAL jobs get scheduled first, no matter what.
@@ -318,88 +343,90 @@ def optimize_schedule(data: dict) -> dict:
     ]
     if critical_flags:
         stage1_expr = sum(critical_flags)
-        status1, opt1 = _solve_maximize(stage1_expr, "STAGE1-CRITICAL")
+        final_status, opt1 = _solve_maximize(stage1_expr, "STAGE1-CRITICAL")
         if opt1 is not None:
-            model.Add(sum(critical_flags) >= int(opt1))
+            _lock_stage(stage1_expr, opt1, "STAGE1-CRITICAL")
     else:
-        opt1 = 0
+        final_status = cp_model.OPTIMAL
 
     # ── Stage 2: Maximize weighted work (priority_weight × duration) ────────
     # Among solutions with the same CRITICAL count, prefer more high-value work.
-    weighted_work = []
-    work_weights = []
-    for i, job in enumerate(jobs):
-        w = PRIORITY_WEIGHT.get(job.get("priority", "LOW"), 5)
-        d = int(job["duration_minutes"])
-        weighted_work.append(is_scheduled[i])
-        work_weights.append(w * d)
+    if final_status == cp_model.OPTIMAL:
+        work_weights = []
+        for i, job in enumerate(jobs):
+            w = PRIORITY_WEIGHT.get(job.get("priority", "LOW"), 5)
+            d = int(job["duration_minutes"])
+            work_weights.append(w * d)
 
-    stage2_expr = sum(int(w) * v for w, v in zip(work_weights, weighted_work))
-    status2, opt2 = _solve_maximize(stage2_expr, "STAGE2-WEIGHTED-WORK")
-    if opt2 is not None:
-        model.Add(stage2_expr >= int(opt2))
+        stage2_expr = sum(int(w) * v for w, v in zip(work_weights, is_scheduled))
+        final_status, opt2 = _solve_maximize(stage2_expr, "STAGE2-WEIGHTED-WORK")
+        if opt2 is not None:
+            _lock_stage(stage2_expr, opt2, "STAGE2-WEIGHTED-WORK")
 
     # ── Stage 3: Maximize total number of jobs scheduled ────────────────────
-    stage3_expr = sum(is_scheduled)
-    status3, opt3 = _solve_maximize(stage3_expr, "STAGE3-TOTAL-JOBS")
-    if opt3 is not None:
-        model.Add(stage3_expr >= int(opt3))
+    if final_status == cp_model.OPTIMAL:
+        stage3_expr = sum(is_scheduled)
+        final_status, opt3 = _solve_maximize(stage3_expr, "STAGE3-TOTAL-JOBS")
+        if opt3 is not None:
+            _lock_stage(stage3_expr, opt3, "STAGE3-TOTAL-JOBS")
 
     # ── Stage 4: Maximize total urgency score ───────────────────────────────
     # This is where AI predicted risk finally influences scheduling.
     # It cannot override Stages 1-3 because those optima are already fixed.
-    urgency_scores = []
-    for job in jobs:
-        # If urgency_score is absent, treat as 0 (backward compatibility).
-        urgency_scores.append(int(job.get("urgency_score", 0)))
+    if final_status == cp_model.OPTIMAL:
+        urgency_scores = []
+        for job in jobs:
+            # If urgency_score is absent, treat as 0 (backward compatibility).
+            urgency_scores.append(int(job.get("urgency_score", 0)))
 
-    stage4_expr = sum(
-        int(u) * v for u, v in zip(urgency_scores, is_scheduled)
-    )
-    status4, opt4 = _solve_maximize(stage4_expr, "STAGE4-URGENCY")
-    if opt4 is not None:
-        model.Add(stage4_expr >= int(opt4))
+        stage4_expr = sum(
+            int(u) * v for u, v in zip(urgency_scores, is_scheduled)
+        )
+        final_status, opt4 = _solve_maximize(stage4_expr, "STAGE4-URGENCY")
+        if opt4 is not None:
+            _lock_stage(stage4_expr, opt4, "STAGE4-URGENCY")
 
     # ── Stage 5: Maximize jobs that finish before their deadline ────────────
     # For each job create a Boolean 'before_deadline[i]' that is 1 only when:
     #     job IS scheduled  AND  end_var[i] <= deadline_in_minutes
-    before_deadline = []
-    for i, job in enumerate(jobs):
-        deadline_str = job.get("deadline", "23:59")
-        deadline_min = _hhmm_to_minutes(deadline_str)
+    if final_status == cp_model.OPTIMAL:
+        before_deadline = []
+        for i, job in enumerate(jobs):
+            deadline_str = job.get("deadline", "23:59")
+            deadline_min = _hhmm_to_minutes(deadline_str)
 
-        bd = model.NewBoolVar(f"bd_{job['maintenance_id']}")
+            bd = model.NewBoolVar(f"bd_{job['maintenance_id']}")
 
-        # bd can only be 1 when the job is scheduled.
-        model.Add(bd <= is_scheduled[i])
+            # bd can only be 1 when the job is scheduled.
+            model.Add(bd <= is_scheduled[i])
 
-        # If bd == 1, the job must finish by its deadline.
-        model.Add(end_var[i] <= deadline_min).OnlyEnforceIf(bd)
+            # If bd == 1, the job must finish by its deadline.
+            model.Add(end_var[i] <= deadline_min).OnlyEnforceIf(bd)
 
-        # If the job is scheduled AND ends on time, bd is forced to 1.
-        # We use a helper Boolean for the "scheduled AND ends on time" check.
-        on_time = model.NewBoolVar(f"ontime_{job['maintenance_id']}")
-        # on_time = 1  iff  is_scheduled[i] = 1  AND  end_var[i] <= deadline_min
-        model.Add(end_var[i] <= deadline_min).OnlyEnforceIf(on_time)
-        model.Add(end_var[i] > deadline_min).OnlyEnforceIf(on_time.Not())
-        # bd must be at least on_time if scheduled (i.e., if scheduled and on time, bd = 1)
-        model.Add(bd >= on_time - (1 - is_scheduled[i]))
+            # If the job is scheduled AND ends on time, bd is forced to 1.
+            # We use a helper Boolean for the "scheduled AND ends on time" check.
+            on_time = model.NewBoolVar(f"ontime_{job['maintenance_id']}")
+            # on_time = 1  iff  is_scheduled[i] = 1  AND  end_var[i] <= deadline_min
+            model.Add(end_var[i] <= deadline_min).OnlyEnforceIf(on_time)
+            model.Add(end_var[i] > deadline_min).OnlyEnforceIf(on_time.Not())
+            # bd must be at least on_time if scheduled (i.e., if scheduled and on time, bd = 1)
+            model.Add(bd >= on_time - (1 - is_scheduled[i]))
 
-        before_deadline.append(bd)
+            before_deadline.append(bd)
 
-    stage5_expr = sum(before_deadline)
-    status5, opt5 = _solve_maximize(stage5_expr, "STAGE5-DEADLINE")
-    if opt5 is not None:
-        model.Add(stage5_expr >= int(opt5))
+        stage5_expr = sum(before_deadline)
+        final_status, opt5 = _solve_maximize(stage5_expr, "STAGE5-DEADLINE")
+        if opt5 is not None:
+            _lock_stage(stage5_expr, opt5, "STAGE5-DEADLINE")
 
     # ── Stage 6: Minimize total completion time (compact/early schedule) ─────
     # Among all equally good solutions, prefer earlier maintenance blocks.
-    stage6_expr = sum(end_var[i] for i in range(len(jobs)))
-    model.Minimize(stage6_expr)
-    status6 = solver.Solve(model)
+    if final_status == cp_model.OPTIMAL:
+        stage6_expr = sum(end_var[i] for i in range(len(jobs)))
+        model.Minimize(stage6_expr)
+        final_status = solver.Solve(model)
 
     # ── Extract solution ───────────────────────────────────────────────────
-    final_status = status6
 
     scheduled_blocks = []
     unscheduled_jobs = []
