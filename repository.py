@@ -20,6 +20,13 @@ from sqlalchemy import desc
 
 from database import SessionLocal
 from models import PlanningRun, ScheduledBlock
+from models import (
+    AssetFeature,
+    MaintenanceRequest,
+    PlanningRun,
+    ScheduledBlock,
+    Train,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -550,3 +557,550 @@ def delete_planning_run(
     finally:
 
         db.close()
+
+
+
+
+# =============================================================================
+# FRONTEND DATA REPOSITORY
+# =============================================================================
+
+
+def get_all_trains() -> list[dict]:
+    """
+    Return all stored train movements in the exact shape
+    expected by the React frontend.
+    """
+
+    db = SessionLocal()
+
+    try:
+        trains = (
+            db.query(Train)
+            .order_by(
+                Train.section,
+                Train.start_time,
+                Train.train_id,
+            )
+            .all()
+        )
+
+        return [
+            {
+                "train_id": train.train_id,
+                "train_name": train.train_name,
+                "section": train.section,
+                "start": train.start_time,
+                "end": train.end_time,
+                "priority": train.priority,
+            }
+            for train in trains
+        ]
+
+    finally:
+        db.close()
+
+
+def add_train_record(train_data: dict) -> dict:
+    """
+    Save one train movement to PostgreSQL.
+    """
+
+    required = [
+        "train_id",
+        "section",
+        "start",
+        "end",
+    ]
+
+    for field in required:
+        if field not in train_data:
+            raise ValueError(
+                f"train must contain '{field}'"
+            )
+
+    db = SessionLocal()
+
+    try:
+        train = Train(
+            train_id=train_data["train_id"],
+            train_name=train_data.get(
+                "train_name"
+            ),
+            section=train_data["section"],
+            start_time=train_data["start"],
+            end_time=train_data["end"],
+            priority=train_data.get(
+                "priority"
+            ),
+            raw_data=deepcopy(
+                train_data
+            ),
+        )
+
+        db.add(train)
+        db.commit()
+        db.refresh(train)
+
+        return {
+            "train_id": train.train_id,
+            "train_name": train.train_name,
+            "section": train.section,
+            "start": train.start_time,
+            "end": train.end_time,
+            "priority": train.priority,
+        }
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+
+def get_all_maintenance_requests() -> list[dict]:
+    """
+    Return maintenance requests in the shape expected by
+    the React frontend.
+
+    If AI risk information exists for a job, the newest
+    AssetFeature row is merged into the maintenance record.
+    """
+
+    db = SessionLocal()
+
+    try:
+        requests = (
+            db.query(MaintenanceRequest)
+            .order_by(
+                MaintenanceRequest.created_at,
+                MaintenanceRequest.maintenance_id,
+            )
+            .all()
+        )
+
+        output = []
+
+        for request_row in requests:
+            result = {
+                "maintenance_id":
+                    request_row.maintenance_id,
+
+                "department":
+                    request_row.department,
+
+                "section":
+                    request_row.section,
+
+                "duration_minutes":
+                    request_row.duration_minutes,
+
+                "priority":
+                    request_row.priority,
+
+                "deadline":
+                    request_row.deadline,
+
+                "status":
+                    request_row.status,
+
+                "shadow_compatible":
+                    request_row.shadow_compatible,
+            }
+
+            # Preserve extra fields originally submitted.
+            if isinstance(
+                request_row.raw_data,
+                dict,
+            ):
+                result.update(
+                    request_row.raw_data
+                )
+
+            latest_ai = (
+                db.query(AssetFeature)
+                .filter(
+                    AssetFeature.maintenance_id
+                    == request_row.maintenance_id
+                )
+                .order_by(
+                    desc(
+                        AssetFeature.created_at
+                    )
+                )
+                .first()
+            )
+
+            if latest_ai is not None:
+                result.update({
+                    "asset_age_years":
+                        latest_ai.asset_age_years,
+
+                    "days_since_last_maintenance":
+                        latest_ai.days_since_last_maintenance,
+
+                    "recent_defect_count":
+                        latest_ai.recent_defect_count,
+
+                    "failures_last_12_months":
+                        latest_ai.failures_last_12_months,
+
+                    "traffic_load_percent":
+                        latest_ai.traffic_load_percent,
+
+                    "predicted_risk_score":
+                        latest_ai.predicted_risk_score,
+
+                    "predicted_risk_level":
+                        latest_ai.predicted_risk_level,
+                })
+
+            output.append(result)
+
+        return output
+
+    finally:
+        db.close()
+
+
+def add_maintenance_record(
+    maintenance_data: dict,
+) -> dict:
+    """
+    Store one maintenance request.
+
+    Extra frontend fields are preserved inside raw_data.
+    """
+
+    required = [
+        "maintenance_id",
+        "department",
+        "section",
+        "duration_minutes",
+        "priority",
+        "deadline",
+    ]
+
+    for field in required:
+        if field not in maintenance_data:
+            raise ValueError(
+                f"maintenance request must contain '{field}'"
+            )
+
+    db = SessionLocal()
+
+    try:
+        existing = (
+            db.query(MaintenanceRequest)
+            .filter(
+                MaintenanceRequest.maintenance_id
+                == maintenance_data[
+                    "maintenance_id"
+                ]
+            )
+            .first()
+        )
+
+        if existing is not None:
+            raise ValueError(
+                "maintenance_id already exists"
+            )
+
+        row = MaintenanceRequest(
+            maintenance_id=
+                maintenance_data[
+                    "maintenance_id"
+                ],
+
+            department=
+                maintenance_data[
+                    "department"
+                ],
+
+            section=
+                maintenance_data[
+                    "section"
+                ],
+
+            duration_minutes=int(
+                maintenance_data[
+                    "duration_minutes"
+                ]
+            ),
+
+            priority=
+                maintenance_data[
+                    "priority"
+                ],
+
+            deadline=
+                maintenance_data[
+                    "deadline"
+                ],
+
+            shadow_compatible=bool(
+                maintenance_data.get(
+                    "shadow_compatible",
+                    False,
+                )
+            ),
+
+            status=
+                maintenance_data.get(
+                    "status",
+                    "PENDING",
+                ),
+
+            raw_data=deepcopy(
+                maintenance_data
+            ),
+        )
+
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+
+        return {
+            "maintenance_id":
+                row.maintenance_id,
+
+            "department":
+                row.department,
+
+            "section":
+                row.section,
+
+            "duration_minutes":
+                row.duration_minutes,
+
+            "priority":
+                row.priority,
+
+            "deadline":
+                row.deadline,
+
+            "status":
+                row.status,
+
+            "shadow_compatible":
+                row.shadow_compatible,
+        }
+
+    except Exception:
+        db.rollback()
+        raise
+
+    finally:
+        db.close()
+
+
+def get_ai_risk_analysis() -> list[dict]:
+    """
+    Return maintenance jobs ordered from highest to lowest
+    predicted AI risk.
+
+    Only jobs that currently have a predicted risk score
+    are included.
+    """
+
+    jobs = get_all_maintenance_requests()
+
+    jobs = [
+        job
+        for job in jobs
+        if job.get(
+            "predicted_risk_score"
+        ) is not None
+    ]
+
+    jobs.sort(
+        key=lambda job:
+            (
+                -float(
+                    job.get(
+                        "predicted_risk_score",
+                        0,
+                    )
+                ),
+                job["maintenance_id"],
+            )
+    )
+
+    return jobs
+
+
+def get_priority_analysis() -> list[dict]:
+    """
+    Return maintenance jobs ordered by urgency score.
+
+    Extra priority fields stored in raw_data such as:
+      priority_score
+      deadline_bonus
+      ai_risk_bonus
+      urgency_score
+
+    are preserved automatically by
+    get_all_maintenance_requests().
+    """
+
+    jobs = get_all_maintenance_requests()
+
+    jobs.sort(
+        key=lambda job:
+            (
+                -int(
+                    job.get(
+                        "urgency_score",
+                        0,
+                    )
+                ),
+                job.get(
+                    "deadline",
+                    "24:00",
+                ),
+                job["maintenance_id"],
+            )
+    )
+
+    return jobs
+
+
+def get_dashboard_summary() -> dict:
+    """
+    Build dashboard metrics using real PostgreSQL data.
+    """
+
+    trains = get_all_trains()
+    maintenance = (
+        get_all_maintenance_requests()
+    )
+
+    latest = (
+        get_latest_planning_run()
+    )
+
+    scheduled_blocks = []
+
+    latest_metrics = {}
+
+    if latest is not None:
+        scheduled_blocks = latest.get(
+            "scheduled_blocks",
+            [],
+        )
+
+        latest_metrics = latest.get(
+            "metrics",
+            {},
+        ) or {}
+
+    high_risk_jobs = [
+        job
+        for job in maintenance
+        if job.get(
+            "predicted_risk_level"
+        ) == "HIGH"
+    ]
+
+    high_risk_jobs.sort(
+        key=lambda job:
+            -float(
+                job.get(
+                    "predicted_risk_score",
+                    0,
+                )
+            )
+    )
+
+    scheduled_count = (
+        latest_metrics.get(
+            "scheduled"
+        )
+    )
+
+    if scheduled_count is None:
+        scheduled_count = len(
+            scheduled_blocks
+        )
+
+    unscheduled_count = (
+        latest_metrics.get(
+            "unscheduled",
+            0,
+        )
+    )
+
+    shadow_count = (
+        latest_metrics.get(
+            "shadow_blocks_scheduled"
+        )
+    )
+
+    if shadow_count is None:
+        shadow_ids = {
+            block.get(
+                "shadow_block_id"
+            )
+            for block
+            in scheduled_blocks
+            if block.get(
+                "shadow_block_id"
+            )
+        }
+
+        shadow_count = len(
+            shadow_ids
+        )
+
+    metrics = {
+        "live_train_movements":
+            len(trains),
+
+        "total_jobs":
+            len(maintenance),
+
+        "critical_jobs":
+            sum(
+                job.get(
+                    "priority"
+                )
+                == "CRITICAL"
+                for job
+                in maintenance
+            ),
+
+        "high_risk_assets":
+            len(
+                high_risk_jobs
+            ),
+
+        "scheduled":
+            scheduled_count,
+
+        "unscheduled":
+            unscheduled_count,
+
+        "shadow_blocks":
+            shadow_count,
+
+        "conflicts":
+            latest_metrics.get(
+                "conflicts",
+                latest_metrics.get(
+                    "recovery_conflicts",
+                    0,
+                ),
+            ),
+    }
+
+    return {
+        "metrics":
+            metrics,
+
+        "recentScheduledBlocks":
+            scheduled_blocks[:3],
+
+        "highRiskJobs":
+            high_risk_jobs[:5],
+    }

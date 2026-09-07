@@ -33,8 +33,15 @@ from shadow_scheduler import schedule_with_shadow_blocks
 from rolling_horizon import recover_schedule
 
 from repository import (
+    add_maintenance_record,
+    add_train_record,
+    get_ai_risk_analysis,
+    get_all_maintenance_requests,
+    get_all_trains,
+    get_dashboard_summary,
     get_latest_planning_run,
     get_planning_run,
+    get_priority_analysis,
     save_planning_run,
 )
 
@@ -733,3 +740,176 @@ def test_recovery_run_is_saved():
 
     finally:
         delete_planning_run(run_id)
+
+# =========================================================
+# FRONTEND DATA ENDPOINTS
+# =========================================================
+
+
+@app.get("/dashboard")
+def dashboard():
+    """
+    Dashboard summary for the React frontend.
+    """
+
+    try:
+        return get_dashboard_summary()
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to load dashboard: {exc}",
+        )
+
+
+# =========================================================
+# TRAINS
+# =========================================================
+
+
+@app.get("/trains")
+def list_trains():
+    """
+    Return all stored train movements.
+    """
+
+    try:
+        return get_all_trains()
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to load trains: {exc}",
+        )
+
+
+@app.post("/trains", status_code=201)
+def create_train(train_data: dict):
+    """
+    Store a new train movement.
+    """
+
+    try:
+        return add_train_record(
+            train_data
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unable to add train: {exc}",
+        )
+
+
+# =========================================================
+# MAINTENANCE REQUESTS
+# =========================================================
+
+
+@app.get("/maintenance")
+def list_maintenance_requests():
+    """
+    Return maintenance requests including available
+    AI-risk and urgency information.
+    """
+
+    try:
+        return (
+            get_all_maintenance_requests()
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to load maintenance "
+                f"requests: {exc}"
+            ),
+        )
+
+
+@app.post(
+    "/maintenance",
+    status_code=201,
+)
+def create_maintenance_request(
+    maintenance_data: dict,
+):
+    """
+    Store a new maintenance request.
+    """
+
+    try:
+        return add_maintenance_record(
+            maintenance_data
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unable to add maintenance "
+                f"request: {exc}"
+            ),
+        )
+
+
+# =========================================================
+# AI RISK ANALYSIS
+# =========================================================
+
+
+@app.get("/ai/risk")
+def ai_risk_analysis():
+    """
+    Return maintenance jobs ordered by predicted
+    failure risk.
+    """
+
+    try:
+        return get_ai_risk_analysis()
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to load AI risk "
+                f"analysis: {exc}"
+            ),
+        )
+
+
+# =========================================================
+# PRIORITY / URGENCY ANALYSIS
+# =========================================================
+
+
+@app.get("/priority")
+def priority_analysis():
+    """
+    Return maintenance jobs ordered by urgency score.
+    """
+
+    try:
+        return get_priority_analysis()
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to load priority "
+                f"analysis: {exc}"
+            ),
+        )    
