@@ -1,17 +1,24 @@
 """
 RailBlock AI — FastAPI Backend
 
-This module exposes the tested RailBlock AI planning logic through HTTP APIs.
+This module exposes the tested RailBlock AI planning logic through HTTP APIs
+and stores planning results in PostgreSQL.
 
 Prototype endpoints
 -------------------
 GET  /health
+
 POST /planning/run
 POST /planning/shadow
 POST /planning/recover
 
-The API does NOT control railway infrastructure.
-It only returns planning/scheduling recommendations.
+GET  /planning/latest
+GET  /planning/runs/{run_id}
+
+IMPORTANT:
+This prototype provides planning recommendations only.
+It does not directly control railway infrastructure, signalling,
+KAVACH, or train movements.
 """
 
 from functools import lru_cache
@@ -25,10 +32,16 @@ from pipeline import run_ai_planning_pipeline
 from shadow_scheduler import schedule_with_shadow_blocks
 from rolling_horizon import recover_schedule
 
+from repository import (
+    get_latest_planning_run,
+    get_planning_run,
+    save_planning_run,
+)
 
-# ---------------------------------------------------------------------------
-# FastAPI application
-# ---------------------------------------------------------------------------
+
+# =============================================================================
+# FASTAPI APPLICATION
+# =============================================================================
 
 app = FastAPI(
     title="RailBlock AI API",
@@ -40,18 +53,19 @@ app = FastAPI(
 )
 
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # CORS
+# =============================================================================
 #
-# Allows the React frontend running locally to call this backend.
-# ---------------------------------------------------------------------------
+# This allows the React frontend running locally to communicate with FastAPI.
+#
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173",   # Vite
+        "http://localhost:5173",
         "http://127.0.0.1:5173",
-        "http://localhost:3000",   # common React dev port
+        "http://localhost:3000",
         "http://127.0.0.1:3000",
     ],
     allow_credentials=True,
@@ -60,21 +74,19 @@ app.add_middleware(
 )
 
 
-# ---------------------------------------------------------------------------
-# Prototype AI model
-# ---------------------------------------------------------------------------
+# =============================================================================
+# PROTOTYPE AI MODEL
+# =============================================================================
 
 @lru_cache(maxsize=1)
 def get_model_bundle():
     """
-    Train and cache the prototype Random Forest model.
+    Train the prototype Random Forest model once and cache it.
 
-    IMPORTANT:
-    The current prototype uses SYNTHETIC historical data because we do not
-    have authorized row-level Indian Railways maintenance/failure records.
+    The prototype currently uses synthetic historical records.
 
-    In production this function would load a model trained on authorized
-    historical railway asset data.
+    In a production railway deployment, this would be replaced by
+    a model trained on authorized real historical asset-maintenance data.
     """
 
     history = generate_synthetic_history(
@@ -82,17 +94,21 @@ def get_model_bundle():
         seed=42,
     )
 
-    return train_risk_model(history)
+    model_bundle = train_risk_model(
+        history
+    )
+
+    return model_bundle
 
 
-# ---------------------------------------------------------------------------
-# Health endpoint
-# ---------------------------------------------------------------------------
+# =============================================================================
+# HEALTH CHECK
+# =============================================================================
 
 @app.get("/health")
 def health():
     """
-    Simple check used by the frontend to confirm that the API is running.
+    Check whether the RailBlock AI backend is running.
     """
 
     return {
@@ -104,16 +120,32 @@ def health():
     }
 
 
-# ---------------------------------------------------------------------------
-# Normal AI + CP-SAT planning
-# ---------------------------------------------------------------------------
+# =============================================================================
+# NORMAL AI + CP-SAT PLANNING
+# =============================================================================
 
 @app.post("/planning/run")
 def planning_run(payload: dict):
     """
     Run the standard RailBlock AI planning pipeline.
 
-    Expected JSON:
+    Flow:
+
+        input
+          ↓
+        validation
+          ↓
+        AI risk prediction
+          ↓
+        priority / urgency scoring
+          ↓
+        CP-SAT optimization
+          ↓
+        PostgreSQL persistence
+          ↓
+        JSON response
+
+    Expected payload:
 
     {
         "data": {
@@ -122,16 +154,7 @@ def planning_run(payload: dict):
             "sections": [...]
         },
 
-        "asset_features": [
-            {
-                "maintenance_id": "M001",
-                "asset_age_years": 12,
-                "days_since_last_maintenance": 180,
-                "recent_defect_count": 3,
-                "failures_last_12_months": 1,
-                "traffic_load_percent": 85
-            }
-        ],
+        "asset_features": [...],
 
         "planning_time": "08:00"
     }
@@ -139,7 +162,9 @@ def planning_run(payload: dict):
 
     try:
 
-        data = payload.get("data")
+        data = payload.get(
+            "data"
+        )
 
         asset_features = payload.get(
             "asset_features",
@@ -156,7 +181,15 @@ def planning_run(payload: dict):
                 "payload must contain 'data'"
             )
 
+        # -------------------------------------------------------------
+        # Get cached Random Forest model
+        # -------------------------------------------------------------
+
         model_bundle = get_model_bundle()
+
+        # -------------------------------------------------------------
+        # Run AI + scoring + CP-SAT
+        # -------------------------------------------------------------
 
         result = run_ai_planning_pipeline(
             data=data,
@@ -165,9 +198,40 @@ def planning_run(payload: dict):
             planning_time=planning_time,
         )
 
-        return result
+        # -------------------------------------------------------------
+        # Save result to PostgreSQL
+        # -------------------------------------------------------------
 
-    except (ValueError, TypeError) as error:
+        run_id = save_planning_run(
+            result=result,
+            planning_type="NORMAL",
+            planning_time=planning_time,
+            input_snapshot={
+                "data": data,
+                "asset_features": asset_features,
+                "planning_time": planning_time,
+            },
+        )
+
+        # -------------------------------------------------------------
+        # Return original result + DB run ID
+        # -------------------------------------------------------------
+
+        response = dict(
+            result
+        )
+
+        response[
+            "planning_run_id"
+        ] = run_id
+
+        return response
+
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+    ) as error:
 
         raise HTTPException(
             status_code=400,
@@ -175,19 +239,19 @@ def planning_run(payload: dict):
         ) from error
 
 
-# ---------------------------------------------------------------------------
-# Shadow Block scheduling
-# ---------------------------------------------------------------------------
+# =============================================================================
+# SHADOW BLOCK PLANNING
+# =============================================================================
 
 @app.post("/planning/shadow")
 def planning_shadow(payload: dict):
     """
     Run Shadow Block Stacking.
 
-    The input should already contain any AI/urgency fields required by
-    scheduling.
+    Compatible maintenance jobs may execute simultaneously inside
+    one shared possession window.
 
-    Expected JSON:
+    Expected payload:
 
     {
         "data": {
@@ -197,27 +261,63 @@ def planning_shadow(payload: dict):
         }
     }
 
-    Compatible jobs may contain:
+    Compatible maintenance jobs contain:
 
         "shadow_compatible": true
     """
 
     try:
 
-        data = payload.get("data")
+        data = payload.get(
+            "data"
+        )
 
         if data is None:
             raise ValueError(
                 "payload must contain 'data'"
             )
 
-        result = schedule_with_shadow_blocks(
-            data
+        # -------------------------------------------------------------
+        # Run Shadow Block scheduler
+        # -------------------------------------------------------------
+
+        result = (
+            schedule_with_shadow_blocks(
+                data
+            )
         )
 
-        return result
+        # -------------------------------------------------------------
+        # Save result to PostgreSQL
+        # -------------------------------------------------------------
 
-    except (ValueError, TypeError, KeyError) as error:
+        run_id = save_planning_run(
+            result=result,
+            planning_type="SHADOW",
+            input_snapshot={
+                "data": data
+            },
+        )
+
+        # -------------------------------------------------------------
+        # Return response
+        # -------------------------------------------------------------
+
+        response = dict(
+            result
+        )
+
+        response[
+            "planning_run_id"
+        ] = run_id
+
+        return response
+
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+    ) as error:
 
         raise HTTPException(
             status_code=400,
@@ -225,22 +325,29 @@ def planning_shadow(payload: dict):
         ) from error
 
 
-# ---------------------------------------------------------------------------
-# Rolling Horizon Recovery
-# ---------------------------------------------------------------------------
+# =============================================================================
+# ROLLING HORIZON RECOVERY
+# =============================================================================
 
 @app.post("/planning/recover")
 def planning_recover(payload: dict):
     """
-    Recover an existing plan after a disruption.
+    Recover an existing maintenance plan after a disruption.
 
-    Expected JSON:
+    Example disruption:
 
     {
-        "previous_result": {
-            "scheduled_blocks": [...],
-            "shadow_blocks": [...]
-        },
+        "type": "TRAIN_DELAY",
+        "section": "Delhi-Ghaziabad",
+        "start": "11:00",
+        "end": "13:00",
+        "description": "Delayed train entered maintenance window"
+    }
+
+    Expected payload:
+
+    {
+        "previous_result": {...},
 
         "updated_data": {
             "trains": [...],
@@ -248,13 +355,7 @@ def planning_recover(payload: dict):
             "sections": [...]
         },
 
-        "disruption": {
-            "type": "TRAIN_DELAY",
-            "section": "Delhi-Ghaziabad",
-            "start": "11:00",
-            "end": "13:00",
-            "description": "Train delay entered maintenance window"
-        }
+        "disruption": {...}
     }
     """
 
@@ -272,6 +373,10 @@ def planning_recover(payload: dict):
             "disruption"
         )
 
+        # -------------------------------------------------------------
+        # Validate payload
+        # -------------------------------------------------------------
+
         if previous_result is None:
             raise ValueError(
                 "payload must contain 'previous_result'"
@@ -287,17 +392,344 @@ def planning_recover(payload: dict):
                 "payload must contain 'disruption'"
             )
 
+        # -------------------------------------------------------------
+        # Run Rolling Horizon Recovery
+        # -------------------------------------------------------------
+
         result = recover_schedule(
             previous_result=previous_result,
             updated_data=updated_data,
             disruption=disruption,
         )
 
-        return result
+        # -------------------------------------------------------------
+        # Save recovered plan to PostgreSQL
+        # -------------------------------------------------------------
 
-    except (ValueError, TypeError, KeyError) as error:
+        run_id = save_planning_run(
+            result=result,
+            planning_type="RECOVERY",
+            planning_time=disruption.get(
+                "start"
+            ),
+            input_snapshot={
+                "updated_data": updated_data,
+                "disruption": disruption,
+            },
+        )
+
+        # -------------------------------------------------------------
+        # Return response
+        # -------------------------------------------------------------
+
+        response = dict(
+            result
+        )
+
+        response[
+            "planning_run_id"
+        ] = run_id
+
+        return response
+
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+    ) as error:
 
         raise HTTPException(
             status_code=400,
             detail=str(error),
         ) from error
+
+
+# =============================================================================
+# LATEST STORED PLANNING RUN
+# =============================================================================
+
+@app.get("/planning/latest")
+def planning_latest(
+    planning_type: str | None = None,
+):
+    """
+    Return the most recently saved planning run from PostgreSQL.
+
+    Examples:
+
+        GET /planning/latest
+
+        GET /planning/latest?planning_type=NORMAL
+
+        GET /planning/latest?planning_type=SHADOW
+
+        GET /planning/latest?planning_type=RECOVERY
+    """
+
+    result = get_latest_planning_run(
+        planning_type=planning_type
+    )
+
+    if result is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="No planning run found",
+        )
+
+    return result
+
+
+# =============================================================================
+# SPECIFIC STORED PLANNING RUN
+# =============================================================================
+
+@app.get("/planning/runs/{run_id}")
+def planning_run_by_id(
+    run_id: str,
+):
+    """
+    Retrieve one saved planning run from PostgreSQL using its UUID.
+    """
+
+    result = get_planning_run(
+        run_id
+    )
+
+    if result is None:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Planning run not found",
+        )
+
+    return result
+
+from repository import delete_planning_run
+
+
+def test_planning_run_is_saved_and_retrievable():
+
+    payload = {
+        "data": {
+            "trains": [],
+            "maintenance_jobs": [
+                {
+                    "maintenance_id": "API-M001",
+                    "department": "Engineering",
+                    "section": "Delhi-Ghaziabad",
+                    "duration_minutes": 60,
+                    "priority": "CRITICAL",
+                    "deadline": "18:00",
+                }
+            ],
+            "sections": [
+                "Delhi-Ghaziabad"
+            ],
+        },
+
+        "asset_features": [
+            {
+                "maintenance_id": "API-M001",
+                "asset_age_years": 20,
+                "days_since_last_maintenance": 250,
+                "recent_defect_count": 4,
+                "failures_last_12_months": 2,
+                "traffic_load_percent": 90,
+            }
+        ],
+
+        "planning_time": "08:00",
+    }
+
+    response = client.post(
+        "/planning/run",
+        json=payload,
+    )
+
+    assert response.status_code == 200
+
+    body = response.json()
+
+    assert "planning_run_id" in body
+
+    run_id = body["planning_run_id"]
+
+    try:
+        stored_response = client.get(
+            f"/planning/runs/{run_id}"
+        )
+
+        assert stored_response.status_code == 200
+
+        stored = stored_response.json()
+
+        assert stored["run_id"] == run_id
+        assert stored["planning_type"] == "NORMAL"
+        assert stored["planning_time"] == "08:00"
+
+        ids = {
+            block["maintenance_id"]
+            for block in stored["scheduled_blocks"]
+        }
+
+        assert "API-M001" in ids
+
+    finally:
+        delete_planning_run(run_id)
+
+
+def test_latest_endpoint_returns_saved_run():
+
+    payload = {
+        "data": {
+            "trains": [],
+            "maintenance_jobs": [
+                {
+                    "maintenance_id": "API-SHADOW-1",
+                    "department": "Engineering",
+                    "section": "Delhi-Ghaziabad",
+                    "duration_minutes": 60,
+                    "priority": "HIGH",
+                    "deadline": "18:00",
+                    "urgency_score": 120,
+                    "shadow_compatible": True,
+                },
+                {
+                    "maintenance_id": "API-SHADOW-2",
+                    "department": "Signal & Telecom",
+                    "section": "Delhi-Ghaziabad",
+                    "duration_minutes": 30,
+                    "priority": "MEDIUM",
+                    "deadline": "18:00",
+                    "urgency_score": 90,
+                    "shadow_compatible": True,
+                },
+            ],
+            "sections": [
+                "Delhi-Ghaziabad"
+            ],
+        }
+    }
+
+    response = client.post(
+        "/planning/shadow",
+        json=payload,
+    )
+
+    assert response.status_code == 200
+
+    run_id = response.json()[
+        "planning_run_id"
+    ]
+
+    try:
+        latest_response = client.get(
+            "/planning/latest",
+            params={
+                "planning_type": "SHADOW"
+            },
+        )
+
+        assert latest_response.status_code == 200
+
+        latest = latest_response.json()
+
+        assert latest["run_id"] == run_id
+        assert latest["planning_type"] == "SHADOW"
+
+    finally:
+        delete_planning_run(run_id)
+
+
+def test_missing_run_returns_404():
+
+    response = client.get(
+        "/planning/runs/00000000-0000-0000-0000-000000000000"
+    )
+
+    assert response.status_code == 404
+
+
+def test_recovery_run_is_saved():
+
+    previous_result = {
+        "scheduled_blocks": [
+            {
+                "maintenance_id": "API-REC-1",
+                "section": "Delhi-Ghaziabad",
+                "department": "Engineering",
+                "priority": "HIGH",
+                "start": "11:00",
+                "end": "12:00",
+                "start_minutes": 660,
+                "end_minutes": 720,
+                "scheduled": True,
+                "shadowed": False,
+            }
+        ],
+        "shadow_blocks": [],
+    }
+
+    updated_data = {
+        "trains": [
+            {
+                "train_id": "API-T001",
+                "section": "Delhi-Ghaziabad",
+                "start": "11:00",
+                "end": "13:00",
+            }
+        ],
+        "maintenance_jobs": [
+            {
+                "maintenance_id": "API-REC-1",
+                "department": "Engineering",
+                "section": "Delhi-Ghaziabad",
+                "duration_minutes": 60,
+                "priority": "HIGH",
+                "deadline": "18:00",
+                "urgency_score": 100,
+                "shadow_compatible": False,
+            }
+        ],
+        "sections": [
+            "Delhi-Ghaziabad"
+        ],
+    }
+
+    disruption = {
+        "type": "TRAIN_DELAY",
+        "section": "Delhi-Ghaziabad",
+        "start": "11:00",
+        "end": "13:00",
+    }
+
+    response = client.post(
+        "/planning/recover",
+        json={
+            "previous_result": previous_result,
+            "updated_data": updated_data,
+            "disruption": disruption,
+        },
+    )
+
+    assert response.status_code == 200
+
+    run_id = response.json()[
+        "planning_run_id"
+    ]
+
+    try:
+        stored_response = client.get(
+            f"/planning/runs/{run_id}"
+        )
+
+        assert stored_response.status_code == 200
+
+        stored = stored_response.json()
+
+        assert stored["planning_type"] == "RECOVERY"
+        assert stored["metrics"]["recovery_conflicts"] == 0
+
+    finally:
+        delete_planning_run(run_id)
